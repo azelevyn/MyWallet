@@ -1,159 +1,123 @@
-// index.js
 require('dotenv').config();
 const { Telegraf, Markup } = require('telegraf');
-const CoinPayments = require('coinpayments');
-const express = require('express');
-const bodyParser = require('body-parser');
 const Database = require('better-sqlite3');
 
-// --- config
-const botToken = process.env.TELEGRAM_BOT_TOKEN;
-const cpPublic = process.env.CP_PUBLIC_KEY;
-const cpPrivate = process.env.CP_PRIVATE_KEY;
-const PORT = process.env.PORT || 3000;
+const bot = new Telegraf(process.env.BOT_TOKEN);
+const ADMIN_USERNAME = process.env.ADMIN_USERNAME || 'youradminusername';
+const PAYMENT_PROVIDER_TOKEN = process.env.PAYMENT_PROVIDER_TOKEN;
+const RATE = 0.0039; // 1 Star = 0.0039 USDT (≈ 250 Stars = 0.98 USDT)
 
-if (!botToken || !cpPublic || !cpPrivate) {
-  console.error('Missing TELEGRAM_BOT_TOKEN or CP_PUBLIC_KEY or CP_PRIVATE_KEY in .env');
-  process.exit(1);
-}
-
-// --- DB (simple)
-const db = new Database('./wallets.db');
+// Database setup
+const db = new Database('./sales.db');
 db.exec(`
-CREATE TABLE IF NOT EXISTS wallets (
-  id INTEGER PRIMARY KEY,
-  telegram_id TEXT UNIQUE,
+CREATE TABLE IF NOT EXISTS sales (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  user_id TEXT,
   username TEXT,
-  currency TEXT,
-  address TEXT,
+  stars INTEGER,
+  usdt REAL,
+  usdt_address TEXT,
+  paid INTEGER DEFAULT 0,
   created_at DATETIME DEFAULT CURRENT_TIMESTAMP
 );
 `);
 
-// prepared statements
-const insertWallet = db.prepare('INSERT OR REPLACE INTO wallets (telegram_id, username, currency, address) VALUES (@telegram_id, @username, @currency, @address)');
-const getWalletByUser = db.prepare('SELECT * FROM wallets WHERE telegram_id = ?');
-
-// --- CoinPayments client (wrapper)
-const cp = new CoinPayments({
-  key: cpPublic,
-  secret: cpPrivate
-});
-
-// --- Telegram bot (Telegraf)
-const bot = new Telegraf(botToken);
-
-// helper: supported options mapping (user-friendly -> CoinPayments currency code)
-const SUPPORTED = {
-  'USDT (TRC20)': 'USDT.TRC20',
-  'USDT (ERC20)': 'USDT.ERC20',
-  'USDT (BEP20)': 'USDT.BEP20',
-  'BTC': 'BTC',
-  'ETH': 'ETH'
-};
-
-// start
-bot.start(async (ctx) => {
-  const name = ctx.from.first_name || 'User';
-  await ctx.reply(`Hi ${name}! 👋\nSaya boleh generate alamat deposit untuk CoinPayments.\nPilih matawang:`, Markup.inlineKeyboard(
-    Object.keys(SUPPORTED).map(k => Markup.button.callback(k, `choose|${k}`)),
-    {columns: 2}
-  ));
-});
-
-// handle choice
-bot.action(/choose\|(.+)/, async (ctx) => {
-  const label = ctx.match[1];
-  const currency = SUPPORTED[label];
-  if (!currency) return ctx.answerCbQuery('Unsupported');
-
-  // check if user already has address for this currency
-  const existing = getWalletByUser.get(String(ctx.from.id));
-  if (existing && existing.currency === currency) {
-    return ctx.editMessageText(`Anda sudah ada alamat untuk ${label}:\n\n${existing.address}\n\nGunakan alamat ini untuk deposit.`);
-  }
-
-  await ctx.answerCbQuery('Generating address...');
-  try {
-    // CoinPayments: get_callback_address (will return deposit address)
-    // wrapper supports method 'get_callback_address'
-    const res = await cp.get_callback_address({ currency });
-    // res should contain .address (per API docs)
-    if (!res || !res.address) {
-      console.error('No address in CP response:', res);
-      return ctx.reply('Gagal dapatkan alamat. Sila cuba lagi kemudian.');
+// START
+bot.start((ctx) => {
+  ctx.reply(
+    `👋 Hello ${ctx.from.first_name}!\n\nWelcome to the *Stars to USDT Exchange Bot*.\nYou can instantly sell your Telegram Stars balance and receive USDT (TRC20).\n\nClick the button below to start.`,
+    {
+      parse_mode: 'Markdown',
+      ...Markup.inlineKeyboard([
+        [Markup.button.callback('💫 Sell Stars for USDT', 'sell_stars')]
+      ])
     }
-
-    // save to DB
-    insertWallet.run({
-      telegram_id: String(ctx.from.id),
-      username: ctx.from.username || `${ctx.from.first_name || ''} ${ctx.from.last_name || ''}`,
-      currency,
-      address: res.address
-    });
-
-    await ctx.editMessageText(`Berjaya! Alamat deposit untuk ${label}:\n\n${res.address}\n\nSila hantar deposit ke alamat ini. Anda akan menerima notifikasi bila deposit dikesan.`);
-  } catch (err) {
-    console.error('Error get_callback_address:', err);
-    await ctx.reply('Ralat semasa generate alamat. Pastikan kunci CoinPayments betul dan akaun anda aktif.');
-  }
+  );
 });
 
-// simple command to check saved address
-bot.command('myaddress', (ctx) => {
-  const row = getWalletByUser.get(String(ctx.from.id));
-  if (!row) return ctx.reply('Tiada alamat disimpan. Gunakan /start untuk mula.');
-  return ctx.reply(`Alamat anda (${row.currency}):\n\n${row.address}`);
-});
-
-// launch bot and express for IPN
-bot.launch().then(()=> console.log('Bot launched'));
-
-// Graceful stop
-process.once('SIGINT', () => bot.stop('SIGINT'));
-process.once('SIGTERM', () => bot.stop('SIGTERM'));
-
-// --- optional: Express IPN listener (CoinPayments will POST IPN events here)
-const app = express();
-app.use(bodyParser.urlencoded({ extended: false }));
-app.use(bodyParser.json());
-
-/*
-  NOTE:
-  - CoinPayments IPN needs to be configured in your merchant account to POST to:
-    https://yourdomain.com/ipn
-  - IPN verification with HMAC header is recommended (see CoinPayments doc).
-  - Here we just accept POST and log. For production you must verify HMAC.
-*/
-app.post('/ipn', (req, res) => {
-  console.log('IPN received:', req.body);
-
-  // basic example: if txn_type / status indicates deposit, notify user
-  // CoinPayments sends merchant 'merchant' and 'ipn_type', 'status', 'address', 'amount', 'currency'
-  try {
-    const body = req.body;
-    const address = body.address;
-    const currency = body.currency;
-    const status = parseInt(body.status, 10); // status >=100 or =2 typically confirmed
-    // find user by address
-    const row = db.prepare('SELECT * FROM wallets WHERE address = ?').get(address);
-    if (row) {
-      // if confirmed
-      if (status >= 100 || status === 2) {
-        // notify via Telegram (fire-and-forget)
-        bot.telegram.sendMessage(row.telegram_id, `Deposit diterima!\nCurrency: ${currency}\nAddress: ${address}\nJumlah: ${body.amount}`);
-      } else {
-        // pending
-        bot.telegram.sendMessage(row.telegram_id, `Deposit diterima (pending).\nCurrency: ${currency}\nAddress: ${address}\nJumlah: ${body.amount}\nStatus: ${status}`);
-      }
+// SELL ACTION
+bot.action('sell_stars', async (ctx) => {
+  await ctx.editMessageText(
+    'Select the amount of *Stars* you want to sell:',
+    {
+      parse_mode: 'Markdown',
+      ...Markup.inlineKeyboard([
+        [Markup.button.callback('250 Stars', 'stars_250'), Markup.button.callback('500 Stars', 'stars_500')],
+        [Markup.button.callback('1000 Stars', 'stars_1000'), Markup.button.callback('2500 Stars', 'stars_2500')],
+        [Markup.button.callback('5000 Stars', 'stars_5000'), Markup.button.callback('10000 Stars', 'stars_10000')],
+        [Markup.button.callback('25000 Stars', 'stars_25000'), Markup.button.callback('50000 Stars', 'stars_50000')],
+        [Markup.button.callback('100000 Stars', 'stars_100000')]
+      ])
     }
-  } catch (e) {
-    console.error('IPN processing error', e);
-  }
-
-  res.status(200).send('OK');
+  );
 });
 
-app.listen(PORT, () => {
-  console.log(`Express IPN server running on port ${PORT}`);
+// When user selects amount
+bot.action(/stars_(\d+)/, async (ctx) => {
+  const stars = parseInt(ctx.match[1]);
+  const usdt = (stars * RATE).toFixed(2);
+
+  ctx.session = { stars, usdt };
+
+  await ctx.editMessageText(
+    `You chose *${stars} Stars*.\nThis equals *${usdt} USDT (TRC20)* 💵\n\nNow, please enter your *USDT TRC20 wallet address* where you’ll receive the payment.`,
+    { parse_mode: 'Markdown' }
+  );
 });
+
+// Get USDT address
+bot.on('text', async (ctx) => {
+  if (!ctx.session || !ctx.session.stars) return ctx.reply('Use /start to begin again.');
+
+  const address = ctx.message.text.trim();
+  const { stars, usdt } = ctx.session;
+
+  // Confirm order
+  await ctx.replyWithInvoice({
+    title: `Sell ${stars} Stars`,
+    description: `Exchange ${stars} Stars for ${usdt} USDT (TRC20)`,
+    provider_token: PAYMENT_PROVIDER_TOKEN,
+    currency: 'XTR', // for Stars
+    prices: [{ label: `${stars} Stars`, amount: stars * 100000 }], // Telegram uses integer micro-units
+    payload: JSON.stringify({ stars, usdt, address }),
+    need_name: false,
+    need_phone_number: false,
+    need_email: false,
+    is_flexible: false
+  });
+
+  await ctx.reply(
+    `Please pay using your Stars balance to confirm your sell order.\nOnce paid, the admin will send ${usdt} USDT to:\n\`${address}\``,
+    { parse_mode: 'Markdown' }
+  );
+});
+
+// Handle pre-checkout
+bot.on('pre_checkout_query', (ctx) => ctx.answerPreCheckoutQuery(true));
+
+// Handle successful payment
+bot.on('successful_payment', async (ctx) => {
+  const payment = ctx.message.successful_payment;
+  const data = JSON.parse(payment.invoice_payload);
+
+  db.prepare(`INSERT INTO sales (user_id, username, stars, usdt, usdt_address, paid)
+              VALUES (?, ?, ?, ?, ?, 1)`)
+    .run(String(ctx.from.id), ctx.from.username || '-', data.stars, data.usdt, data.address);
+
+  await ctx.reply(
+    `✅ Payment received!\nYou sold *${data.stars} Stars* for *${data.usdt} USDT*.\nAdmin will send your payment soon to:\n\`${data.address}\``,
+    { parse_mode: 'Markdown' }
+  );
+
+  // Notify admin
+  await bot.telegram.sendMessage(
+    `@${ADMIN_USERNAME}`,
+    `💰 *NEW SALE*\n\n👤 User: @${ctx.from.username || ctx.from.id}\n💫 Stars: ${data.stars}\n💵 USDT: ${data.usdt}\n🏦 Wallet: \`${data.address}\`\n\n✅ Payment completed via Stars.`,
+    { parse_mode: 'Markdown' }
+  );
+
+  ctx.session = {};
+});
+
+bot.launch();
+console.log('🚀 Bot is running and ready to accept Stars payments!');
