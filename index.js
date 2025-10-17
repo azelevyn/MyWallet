@@ -1,182 +1,160 @@
-// index.js
 require('dotenv').config();
 const { Telegraf } = require('telegraf');
-const { RestClient, FuturesClientV2 } = require('bitmart-api');
+const { Spot, Contract } = require('@bitmartexchange/bitmart-node-sdk');
 
+// === Environment Variables ===
 const BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
-const BITMART_API_KEY = process.env.BITMART_API_KEY;
-const BITMART_API_SECRET = process.env.BITMART_API_SECRET;
-const BITMART_API_MEMO = process.env.BITMART_API_MEMO || undefined;
+const API_KEY = process.env.BITMART_API_KEY;
+const API_SECRET = process.env.BITMART_API_SECRET;
+const API_MEMO = process.env.BITMART_API_MEMO;
 
-if (!BOT_TOKEN) {
-  console.error('Missing TELEGRAM_BOT_TOKEN in .env');
-  process.exit(1);
-}
-if (!BITMART_API_KEY || !BITMART_API_SECRET) {
-  console.error('Missing BitMart API keys in .env');
+if (!BOT_TOKEN || !API_KEY || !API_SECRET) {
+  console.error('Missing .env values. Please set TELEGRAM_BOT_TOKEN and BitMart API keys.');
   process.exit(1);
 }
 
+// === Initialize Clients ===
 const bot = new Telegraf(BOT_TOKEN);
-
-// Initialize BitMart clients
-const restClient = new RestClient({
-  apiKey: BITMART_API_KEY,
-  apiSecret: BITMART_API_SECRET,
-  apiMemo: BITMART_API_MEMO,
+const spotClient = new Spot({
+  apiKey: API_KEY,
+  apiSecret: API_SECRET,
+  memo: API_MEMO,
 });
-const futuresClient = new FuturesClientV2({
-  apiKey: BITMART_API_KEY,
-  apiSecret: BITMART_API_SECRET,
-  apiMemo: BITMART_API_MEMO,
+const futuresClient = new Contract({
+  apiKey: API_KEY,
+  apiSecret: API_SECRET,
+  memo: API_MEMO,
 });
 
+// === Start Command ===
 bot.start((ctx) => {
-  ctx.reply(`Hello ${ctx.from.first_name || 'trader'}! Available commands:\n/balance\n/spot-buy symbol side amount price\n/spot-sell symbol side amount price\n/withdraw currency address amount\n/futures-order symbol side size price (for futures)`);
+  ctx.reply(
+    `👋 Hello ${ctx.from.first_name || 'trader'}!\n\n` +
+    `Here are available commands:\n` +
+    `/balance - Check your account balances\n` +
+    `/spotbuy BTC_USDT 0.001 30000 - Buy spot order\n` +
+    `/spotsell BTC_USDT 0.001 35000 - Sell spot order\n` +
+    `/withdraw USDT <address> 10 - Withdraw funds\n` +
+    `/futures BTCUSDT buy 1 30000 - Futures order`
+  );
 });
 
-// 1) Get balances
+// === Check Balance ===
 bot.command('balance', async (ctx) => {
   try {
-    const res = await restClient.getAccountBalancesV1();
-    // res structure per SDK — print summary
-    const balances = (res && res.data) ? res.data : res;
-    // Build readable message (show only non-zero balances)
-    const nonZero = (balances || []).filter(b => parseFloat(b.available) + parseFloat(b.frozen) > 0);
-    if (nonZero.length === 0) {
-      return ctx.reply('No non-zero balances found.');
+    const result = await spotClient.getAccountBalance();
+    const balances = result.data?.balances || [];
+    const nonZero = balances.filter(b => parseFloat(b.available) > 0 || parseFloat(b.frozen) > 0);
+    if (nonZero.length === 0) return ctx.reply('No non-zero balances found.');
+
+    let msg = '💰 Your Balances:\n';
+    for (const b of nonZero) {
+      msg += `${b.currency}: available=${b.available}, frozen=${b.frozen}\n`;
     }
-    const lines = nonZero.map(b => `${b.currency}: available=${b.available} frozen=${b.frozen}`);
-    ctx.reply(lines.join('\n'));
+    ctx.reply(msg);
   } catch (err) {
-    console.error('balance error', err);
-    ctx.reply('Error fetching balances: ' + (err.message || JSON.stringify(err)));
+    console.error(err);
+    ctx.reply('❌ Error getting balance: ' + err.message);
   }
 });
 
-/*
-  Example usage:
-  /spot-buy BTC_USDT buy 0.001 30000
-  /spot-sell BTC_USDT sell 0.001 35000
-*/
-bot.command('spot-buy', async (ctx) => {
-  const parts = ctx.message.text.split(/\s+/);
-  if (parts.length < 5) return ctx.reply('Usage: /spot-buy SYMBOL side size price\nExample: /spot-buy BTC_USDT buy 0.001 30000');
-  const [, symbol, side, size, price] = parts;
+// === Spot Buy ===
+bot.command('spotbuy', async (ctx) => {
+  const parts = ctx.message.text.split(' ');
+  if (parts.length < 4) return ctx.reply('Usage: /spotbuy SYMBOL SIZE PRICE\nExample: /spotbuy BTC_USDT 0.001 30000');
+  const [, symbol, size, price] = parts;
+
   try {
-    const res = await restClient.submitSpotOrderV2({
+    const res = await spotClient.submitOrder({
       symbol,
-      side, // 'buy' or 'sell'
+      side: 'buy',
       type: 'limit',
-      size: String(size),
-      price: String(price),
+      size,
+      price,
     });
-    ctx.reply('Spot order response: ' + JSON.stringify(res));
+    ctx.reply(`✅ Spot BUY order placed!\n${JSON.stringify(res, null, 2)}`);
   } catch (err) {
-    console.error('spot-buy error', err);
-    ctx.reply('Error placing spot buy: ' + (err.message || JSON.stringify(err)));
+    console.error(err);
+    ctx.reply('❌ Error placing buy order: ' + err.message);
   }
 });
 
-bot.command('spot-sell', async (ctx) => {
-  const parts = ctx.message.text.split(/\s+/);
-  if (parts.length < 5) return ctx.reply('Usage: /spot-sell SYMBOL side size price\nExample: /spot-sell BTC_USDT sell 0.001 35000');
-  const [, symbol, side, size, price] = parts;
+// === Spot Sell ===
+bot.command('spotsell', async (ctx) => {
+  const parts = ctx.message.text.split(' ');
+  if (parts.length < 4) return ctx.reply('Usage: /spotsell SYMBOL SIZE PRICE\nExample: /spotsell BTC_USDT 0.001 35000');
+  const [, symbol, size, price] = parts;
+
   try {
-    const res = await restClient.submitSpotOrderV2({
+    const res = await spotClient.submitOrder({
       symbol,
-      side,
+      side: 'sell',
       type: 'limit',
-      size: String(size),
-      price: String(price),
+      size,
+      price,
     });
-    ctx.reply('Spot sell response: ' + JSON.stringify(res));
+    ctx.reply(`✅ Spot SELL order placed!\n${JSON.stringify(res, null, 2)}`);
   } catch (err) {
-    console.error('spot-sell error', err);
-    ctx.reply('Error placing spot sell: ' + (err.message || JSON.stringify(err)));
+    console.error(err);
+    ctx.reply('❌ Error placing sell order: ' + err.message);
   }
 });
 
-/*
-  Withdraw (example):
-  /withdraw USDT <address> 10
-  Note: many exchanges require whitelist, email/code confirmation, etc. Withdrawals may not work via API depending on key perms.
-*/
+// === Withdraw ===
 bot.command('withdraw', async (ctx) => {
-  const parts = ctx.message.text.split(/\s+/);
-  if (parts.length < 4) return ctx.reply('Usage: /withdraw CURRENCY address amount\nExample: /withdraw USDT Txxxx 10');
+  const parts = ctx.message.text.split(' ');
+  if (parts.length < 4)
+    return ctx.reply('Usage: /withdraw CURRENCY ADDRESS AMOUNT\nExample: /withdraw USDT TXxxxxxx 10');
+
   const [, currency, address, amount] = parts;
+
   try {
-    // SDK method name may differ; check docs/examples. Many SDKs expose a withdraw/createWithdrawal endpoint.
-    // Here we attempt a generic endpoint call. Replace with SDK withdraw method if available.
-    const payload = {
+    const res = await spotClient.submitWithdraw({
       currency,
-      amount: String(amount),
+      amount,
       address,
-      // network?: 'TRC20', // add network param if required
-      // destination?: 'address', // check API docs
-    };
-    // Some SDKs have createWithdrawalV1 or similar. We'll try a common naming convention:
-    let res;
-    if (typeof restClient.createWithdrawalV1 === 'function') {
-      res = await restClient.createWithdrawalV1(payload);
-    } else if (typeof restClient.submitWithdrawV1 === 'function') {
-      res = await restClient.submitWithdrawV1(payload);
-    } else {
-      // Fallback: call raw REST path via SDK's generic request method (if present)
-      if (typeof restClient.request === 'function') {
-        res = await restClient.request('POST', '/wallet/withdrawal', payload);
-      } else {
-        throw new Error('Withdrawal method not available on installed SDK; check your SDK docs and adjust code.');
-      }
-    }
-    ctx.reply('Withdraw response: ' + JSON.stringify(res));
+      network: 'TRC20', // modify based on your coin network
+    });
+    ctx.reply(`✅ Withdrawal submitted!\n${JSON.stringify(res, null, 2)}`);
   } catch (err) {
-    console.error('withdraw error', err);
-    ctx.reply('Error submitting withdrawal: ' + (err.message || JSON.stringify(err)));
+    console.error(err);
+    ctx.reply('❌ Error submitting withdrawal: ' + err.message);
   }
 });
 
-/*
-  Futures order:
-  /futures-order BTCUSDT long 1 30000
-  Adapt to your contract symbol formatting as BitMart expects.
-*/
-bot.command('futures-order', async (ctx) => {
-  const parts = ctx.message.text.split(/\s+/);
-  if (parts.length < 5) return ctx.reply('Usage: /futures-order SYMBOL side size price\nExample: /futures-order BTCUSDT buy 1 30000');
+// === Futures Order ===
+bot.command('futures', async (ctx) => {
+  const parts = ctx.message.text.split(' ');
+  if (parts.length < 5)
+    return ctx.reply('Usage: /futures SYMBOL SIDE SIZE PRICE\nExample: /futures BTCUSDT buy 1 30000');
+
   const [, symbol, side, size, price] = parts;
+
   try {
-    // Example: using FuturesClientV2's typical submit method (check SDK for exact signature)
-    if (typeof futuresClient.submitContractOrder === 'function') {
-      const res = await futuresClient.submitContractOrder({
-        symbol,
-        side: side.toLowerCase(), // 'buy'/'sell' or 'open_long' — check SDK docs
-        size: String(size),
-        price: String(price),
-        order_type: 'limit',
-      });
-      ctx.reply('Futures order response: ' + JSON.stringify(res));
-    } else {
-      // Some SDKs expose createOrderV2, placeOrder, etc. See docs if this branch triggers.
-      throw new Error('Futures order method not found in SDK. See SDK docs for exact function name.');
-    }
+    const res = await futuresClient.submitOrder({
+      symbol,
+      side: side.toUpperCase(),
+      type: 'limit',
+      size,
+      price,
+    });
+    ctx.reply(`✅ Futures order placed!\n${JSON.stringify(res, null, 2)}`);
   } catch (err) {
-    console.error('futures-order error', err);
-    ctx.reply('Error placing futures order: ' + (err.message || JSON.stringify(err)));
+    console.error(err);
+    ctx.reply('❌ Error placing futures order: ' + err.message);
   }
 });
 
-// Basic error handling
+// === Global Error Handling ===
 bot.catch((err, ctx) => {
-  console.error(`Bot error for ${ctx.updateType}`, err);
+  console.error(`Error for ${ctx.updateType}`, err);
 });
 
-// Launch
+// === Launch ===
 bot.launch()
-  .then(() => console.log('Bot started'))
-  .catch(err => console.error('Failed to start bot', err));
+  .then(() => console.log('✅ Telegram Bot started successfully'))
+  .catch(err => console.error('❌ Failed to start bot:', err));
 
-// Graceful stop
+// Graceful shutdown
 process.once('SIGINT', () => bot.stop('SIGINT'));
 process.once('SIGTERM', () => bot.stop('SIGTERM'));
