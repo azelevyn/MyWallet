@@ -1,123 +1,182 @@
+// index.js
 require('dotenv').config();
-const { Telegraf, Markup } = require('telegraf');
-const Database = require('better-sqlite3');
+const { Telegraf } = require('telegraf');
+const { RestClient, FuturesClientV2 } = require('bitmart-api');
 
-const bot = new Telegraf(process.env.BOT_TOKEN);
-const ADMIN_USERNAME = process.env.ADMIN_USERNAME || 'youradminusername';
-const PAYMENT_PROVIDER_TOKEN = process.env.PAYMENT_PROVIDER_TOKEN;
-const RATE = 0.0039; // 1 Star = 0.0039 USDT (≈ 250 Stars = 0.98 USDT)
+const BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
+const BITMART_API_KEY = process.env.BITMART_API_KEY;
+const BITMART_API_SECRET = process.env.BITMART_API_SECRET;
+const BITMART_API_MEMO = process.env.BITMART_API_MEMO || undefined;
 
-// Database setup
-const db = new Database('./sales.db');
-db.exec(`
-CREATE TABLE IF NOT EXISTS sales (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
-  user_id TEXT,
-  username TEXT,
-  stars INTEGER,
-  usdt REAL,
-  usdt_address TEXT,
-  paid INTEGER DEFAULT 0,
-  created_at DATETIME DEFAULT CURRENT_TIMESTAMP
-);
-`);
+if (!BOT_TOKEN) {
+  console.error('Missing TELEGRAM_BOT_TOKEN in .env');
+  process.exit(1);
+}
+if (!BITMART_API_KEY || !BITMART_API_SECRET) {
+  console.error('Missing BitMart API keys in .env');
+  process.exit(1);
+}
 
-// START
+const bot = new Telegraf(BOT_TOKEN);
+
+// Initialize BitMart clients
+const restClient = new RestClient({
+  apiKey: BITMART_API_KEY,
+  apiSecret: BITMART_API_SECRET,
+  apiMemo: BITMART_API_MEMO,
+});
+const futuresClient = new FuturesClientV2({
+  apiKey: BITMART_API_KEY,
+  apiSecret: BITMART_API_SECRET,
+  apiMemo: BITMART_API_MEMO,
+});
+
 bot.start((ctx) => {
-  ctx.reply(
-    `👋 Hello ${ctx.from.first_name}!\n\nWelcome to the *Stars to USDT Exchange Bot*.\nYou can instantly sell your Telegram Stars balance and receive USDT (TRC20).\n\nClick the button below to start.`,
-    {
-      parse_mode: 'Markdown',
-      ...Markup.inlineKeyboard([
-        [Markup.button.callback('💫 Sell Stars for USDT', 'sell_stars')]
-      ])
+  ctx.reply(`Hello ${ctx.from.first_name || 'trader'}! Available commands:\n/balance\n/spot-buy symbol side amount price\n/spot-sell symbol side amount price\n/withdraw currency address amount\n/futures-order symbol side size price (for futures)`);
+});
+
+// 1) Get balances
+bot.command('balance', async (ctx) => {
+  try {
+    const res = await restClient.getAccountBalancesV1();
+    // res structure per SDK — print summary
+    const balances = (res && res.data) ? res.data : res;
+    // Build readable message (show only non-zero balances)
+    const nonZero = (balances || []).filter(b => parseFloat(b.available) + parseFloat(b.frozen) > 0);
+    if (nonZero.length === 0) {
+      return ctx.reply('No non-zero balances found.');
     }
-  );
+    const lines = nonZero.map(b => `${b.currency}: available=${b.available} frozen=${b.frozen}`);
+    ctx.reply(lines.join('\n'));
+  } catch (err) {
+    console.error('balance error', err);
+    ctx.reply('Error fetching balances: ' + (err.message || JSON.stringify(err)));
+  }
 });
 
-// SELL ACTION
-bot.action('sell_stars', async (ctx) => {
-  await ctx.editMessageText(
-    'Select the amount of *Stars* you want to sell:',
-    {
-      parse_mode: 'Markdown',
-      ...Markup.inlineKeyboard([
-        [Markup.button.callback('250 Stars', 'stars_250'), Markup.button.callback('500 Stars', 'stars_500')],
-        [Markup.button.callback('1000 Stars', 'stars_1000'), Markup.button.callback('2500 Stars', 'stars_2500')],
-        [Markup.button.callback('5000 Stars', 'stars_5000'), Markup.button.callback('10000 Stars', 'stars_10000')],
-        [Markup.button.callback('25000 Stars', 'stars_25000'), Markup.button.callback('50000 Stars', 'stars_50000')],
-        [Markup.button.callback('100000 Stars', 'stars_100000')]
-      ])
+/*
+  Example usage:
+  /spot-buy BTC_USDT buy 0.001 30000
+  /spot-sell BTC_USDT sell 0.001 35000
+*/
+bot.command('spot-buy', async (ctx) => {
+  const parts = ctx.message.text.split(/\s+/);
+  if (parts.length < 5) return ctx.reply('Usage: /spot-buy SYMBOL side size price\nExample: /spot-buy BTC_USDT buy 0.001 30000');
+  const [, symbol, side, size, price] = parts;
+  try {
+    const res = await restClient.submitSpotOrderV2({
+      symbol,
+      side, // 'buy' or 'sell'
+      type: 'limit',
+      size: String(size),
+      price: String(price),
+    });
+    ctx.reply('Spot order response: ' + JSON.stringify(res));
+  } catch (err) {
+    console.error('spot-buy error', err);
+    ctx.reply('Error placing spot buy: ' + (err.message || JSON.stringify(err)));
+  }
+});
+
+bot.command('spot-sell', async (ctx) => {
+  const parts = ctx.message.text.split(/\s+/);
+  if (parts.length < 5) return ctx.reply('Usage: /spot-sell SYMBOL side size price\nExample: /spot-sell BTC_USDT sell 0.001 35000');
+  const [, symbol, side, size, price] = parts;
+  try {
+    const res = await restClient.submitSpotOrderV2({
+      symbol,
+      side,
+      type: 'limit',
+      size: String(size),
+      price: String(price),
+    });
+    ctx.reply('Spot sell response: ' + JSON.stringify(res));
+  } catch (err) {
+    console.error('spot-sell error', err);
+    ctx.reply('Error placing spot sell: ' + (err.message || JSON.stringify(err)));
+  }
+});
+
+/*
+  Withdraw (example):
+  /withdraw USDT <address> 10
+  Note: many exchanges require whitelist, email/code confirmation, etc. Withdrawals may not work via API depending on key perms.
+*/
+bot.command('withdraw', async (ctx) => {
+  const parts = ctx.message.text.split(/\s+/);
+  if (parts.length < 4) return ctx.reply('Usage: /withdraw CURRENCY address amount\nExample: /withdraw USDT Txxxx 10');
+  const [, currency, address, amount] = parts;
+  try {
+    // SDK method name may differ; check docs/examples. Many SDKs expose a withdraw/createWithdrawal endpoint.
+    // Here we attempt a generic endpoint call. Replace with SDK withdraw method if available.
+    const payload = {
+      currency,
+      amount: String(amount),
+      address,
+      // network?: 'TRC20', // add network param if required
+      // destination?: 'address', // check API docs
+    };
+    // Some SDKs have createWithdrawalV1 or similar. We'll try a common naming convention:
+    let res;
+    if (typeof restClient.createWithdrawalV1 === 'function') {
+      res = await restClient.createWithdrawalV1(payload);
+    } else if (typeof restClient.submitWithdrawV1 === 'function') {
+      res = await restClient.submitWithdrawV1(payload);
+    } else {
+      // Fallback: call raw REST path via SDK's generic request method (if present)
+      if (typeof restClient.request === 'function') {
+        res = await restClient.request('POST', '/wallet/withdrawal', payload);
+      } else {
+        throw new Error('Withdrawal method not available on installed SDK; check your SDK docs and adjust code.');
+      }
     }
-  );
+    ctx.reply('Withdraw response: ' + JSON.stringify(res));
+  } catch (err) {
+    console.error('withdraw error', err);
+    ctx.reply('Error submitting withdrawal: ' + (err.message || JSON.stringify(err)));
+  }
 });
 
-// When user selects amount
-bot.action(/stars_(\d+)/, async (ctx) => {
-  const stars = parseInt(ctx.match[1]);
-  const usdt = (stars * RATE).toFixed(2);
-
-  ctx.session = { stars, usdt };
-
-  await ctx.editMessageText(
-    `You chose *${stars} Stars*.\nThis equals *${usdt} USDT (TRC20)* 💵\n\nNow, please enter your *USDT TRC20 wallet address* where you’ll receive the payment.`,
-    { parse_mode: 'Markdown' }
-  );
+/*
+  Futures order:
+  /futures-order BTCUSDT long 1 30000
+  Adapt to your contract symbol formatting as BitMart expects.
+*/
+bot.command('futures-order', async (ctx) => {
+  const parts = ctx.message.text.split(/\s+/);
+  if (parts.length < 5) return ctx.reply('Usage: /futures-order SYMBOL side size price\nExample: /futures-order BTCUSDT buy 1 30000');
+  const [, symbol, side, size, price] = parts;
+  try {
+    // Example: using FuturesClientV2's typical submit method (check SDK for exact signature)
+    if (typeof futuresClient.submitContractOrder === 'function') {
+      const res = await futuresClient.submitContractOrder({
+        symbol,
+        side: side.toLowerCase(), // 'buy'/'sell' or 'open_long' — check SDK docs
+        size: String(size),
+        price: String(price),
+        order_type: 'limit',
+      });
+      ctx.reply('Futures order response: ' + JSON.stringify(res));
+    } else {
+      // Some SDKs expose createOrderV2, placeOrder, etc. See docs if this branch triggers.
+      throw new Error('Futures order method not found in SDK. See SDK docs for exact function name.');
+    }
+  } catch (err) {
+    console.error('futures-order error', err);
+    ctx.reply('Error placing futures order: ' + (err.message || JSON.stringify(err)));
+  }
 });
 
-// Get USDT address
-bot.on('text', async (ctx) => {
-  if (!ctx.session || !ctx.session.stars) return ctx.reply('Use /start to begin again.');
-
-  const address = ctx.message.text.trim();
-  const { stars, usdt } = ctx.session;
-
-  // Confirm order
-  await ctx.replyWithInvoice({
-    title: `Sell ${stars} Stars`,
-    description: `Exchange ${stars} Stars for ${usdt} USDT (TRC20)`,
-    provider_token: PAYMENT_PROVIDER_TOKEN,
-    currency: 'XTR', // for Stars
-    prices: [{ label: `${stars} Stars`, amount: stars * 100000 }], // Telegram uses integer micro-units
-    payload: JSON.stringify({ stars, usdt, address }),
-    need_name: false,
-    need_phone_number: false,
-    need_email: false,
-    is_flexible: false
-  });
-
-  await ctx.reply(
-    `Please pay using your Stars balance to confirm your sell order.\nOnce paid, the admin will send ${usdt} USDT to:\n\`${address}\``,
-    { parse_mode: 'Markdown' }
-  );
+// Basic error handling
+bot.catch((err, ctx) => {
+  console.error(`Bot error for ${ctx.updateType}`, err);
 });
 
-// Handle pre-checkout
-bot.on('pre_checkout_query', (ctx) => ctx.answerPreCheckoutQuery(true));
+// Launch
+bot.launch()
+  .then(() => console.log('Bot started'))
+  .catch(err => console.error('Failed to start bot', err));
 
-// Handle successful payment
-bot.on('successful_payment', async (ctx) => {
-  const payment = ctx.message.successful_payment;
-  const data = JSON.parse(payment.invoice_payload);
-
-  db.prepare(`INSERT INTO sales (user_id, username, stars, usdt, usdt_address, paid)
-              VALUES (?, ?, ?, ?, ?, 1)`)
-    .run(String(ctx.from.id), ctx.from.username || '-', data.stars, data.usdt, data.address);
-
-  await ctx.reply(
-    `✅ Payment received!\nYou sold *${data.stars} Stars* for *${data.usdt} USDT*.\nAdmin will send your payment soon to:\n\`${data.address}\``,
-    { parse_mode: 'Markdown' }
-  );
-
-  // Notify admin
-  await bot.telegram.sendMessage(
-    `@${ADMIN_USERNAME}`,
-    `💰 *NEW SALE*\n\n👤 User: @${ctx.from.username || ctx.from.id}\n💫 Stars: ${data.stars}\n💵 USDT: ${data.usdt}\n🏦 Wallet: \`${data.address}\`\n\n✅ Payment completed via Stars.`,
-    { parse_mode: 'Markdown' }
-  );
-
-  ctx.session = {};
-});
-
-bot.launch();
-console.log('🚀 Bot is running and ready to accept Stars payments!');
+// Graceful stop
+process.once('SIGINT', () => bot.stop('SIGINT'));
+process.once('SIGTERM', () => bot.stop('SIGTERM'));
